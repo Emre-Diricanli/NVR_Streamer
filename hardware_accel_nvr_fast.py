@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Show all NVR channels in ONE tiled window (grid mosaic).
+Show all NVR channels in ONE tiled window (grid mosaic) with optional GPU decode.
 
 - Discovers a working RTSP URL per channel using common templates.
 - Starts one reader thread per channel (stores latest frame only).
-- Renders a live grid window (e.g., 4x3 for 12 channels) with overlays.
+- Renders a live grid window with overlays.
+- Prefers GStreamer + HW decode (NVDEC / VA-API). Falls back to FFmpeg/CPU.
 
 Quit: press 'q' while the mosaic window is focused.
 
 Requirements:
   - Python 3.8+
   - pip install opencv-python
-  - (Recommended) FFmpeg installed on system
+  - System: GStreamer runtime (see notes above) for GPU path
 """
 
 import os
@@ -24,10 +25,10 @@ import cv2
 import numpy as np
 
 # ----------------- CONFIGURE THESE -----------------
-NVR_IP = "76.125.101.96"
-NVR_PORT = 5541     # 554 is default; use your RTSP port
-NVR_USER = "admin"
-NVR_PASS = "ashlee1999"
+NVR_IP = "192.168.0.71"
+NVR_PORT = 554     
+NVR_USER = "ai"
+NVR_PASS = "1880teso@"
 
 CHANNEL_COUNT = 16    # number of channels to show
 GRID_COLS = 4         # e.g., 4 columns x 3 rows = 12
@@ -43,12 +44,16 @@ TARGET_FPS = 10
 # Try both non-padded (1) and zero-padded (01) channel numbers with these templates
 TRY_TEMPLATES = [
     # --- Hikvision (CCSS where CC=channel 01.., SS=01 main / 02 sub) ---
-    "rtsp://{user}:{pwd}@{ip}:{port}/Streaming/Channels/{hik_cc}01",
+    # "rtsp://{user}:{pwd}@{ip}:{port}/Streaming/Channels/{hik_cc}01",
     "rtsp://{user}:{pwd}@{ip}:{port}/Streaming/Channels/{hik_cc}02",
 
     # --- Dahua / Amcrest ---
-    "rtsp://{user}:{pwd}@{ip}:{port}/cam/realmonitor?channel={ch}&subtype=0",
+    # "rtsp://{user}:{pwd}@{ip}:{port}/cam/realmonitor?channel={ch}&subtype=0",
     "rtsp://{user}:{pwd}@{ip}:{port}/cam/realmonitor?channel={ch}&subtype=1",
+
+    # --- Web Client ---
+    "rtsp://{user}:{pwd}@{ip}:{port}/unicast/c{ch}/s1/live",
+    "rtsp://{user}:{pwd}@{ip}:{port}/unicast/c{ch}/s0/live",
 
     # --- Reolink ---
     "rtsp://{user}:{pwd}@{ip}:{port}/h264Preview_{ch}_main",
@@ -78,20 +83,132 @@ LOCK_TEMPLATE_AFTER_FIRST_MATCH = True   # if True, prefer the first successful 
 STRICT_LOCKED_TEMPLATE = True            # if True, do NOT fallback to other templates for later channels when locked
 SELECTED_TEMPLATE: Optional[str] = None  # will hold the winning template string once discovered
 
-# Force RTSP over TCP and reduce buffering (supported by OpenCV+FFmpeg)
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000|max_delay;5000000|buffer_size;1048576|allowed_media_types;video")
+# Force RTSP over TCP, reduce buffering (FFmpeg backend). GStreamer path ignores this.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000|max_delay;5000000|buffer_size;1048576|allowed_media_types;video"
+)
+
+# Choose GPU vendor for GStreamer path: nvidia | intel | amd | vaapi | auto
+GST_GPU_VENDOR = os.getenv("GST_GPU_VENDOR", "auto").lower()
+
+# ---------------------------------------------------
+#  GPU/GStreamer Helpers
 # ---------------------------------------------------
 
+def have_gstreamer() -> bool:
+    """
+    Quick check: CAP_GSTREAMER constant exists and backend is available.
+    """
+    try:
+        _ = cv2.CAP_GSTREAMER
+        return True
+    except AttributeError:
+        return False
+
+
+def _gs_common_front(rtsp_url: str) -> str:
+    # rtspsrc protocols=tcp to reduce packet loss; latency tweak for smoother playback
+    return (f'rtspsrc location="{rtsp_url}" protocols=tcp latency=200 ! '
+            'rtpjitterbuffer ! ')
+
+
+def _build_hw_pipelines(rtsp_url: str, vendor: str = "auto") -> List[str]:
+    """
+    Build a list of candidate GStreamer pipelines that attempt HW decode first.
+    We try both H.264 and H.265 variants, with multiple decoder element fallbacks.
+    """
+    front_h264 = _gs_common_front(rtsp_url) + 'rtph264depay ! h264parse ! '
+    front_h265 = _gs_common_front(rtsp_url) + 'rtph265depay ! h265parse ! '
+
+    # Common tail: convert to BGR for OpenCV in system memory
+    tail = 'videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1 sync=false'
+
+    pipelines: List[str] = []
+
+    vend = vendor
+    if vend == "intel" or vend == "amd":
+        vend = "vaapi"
+    if vend not in ("nvidia", "vaapi", "auto"):
+        vend = "auto"
+
+    if vend in ("nvidia", "auto"):
+        # NVIDIA NVDEC (requires gstreamer NVDEC plugins + driver)
+        # H.264 / H.265 decoders:
+        pipelines += [
+            front_h264 + 'nvh264dec ! ' + tail,
+            front_h265 + 'nvh265dec ! ' + tail,
+        ]
+
+    if vend in ("vaapi", "auto"):
+        # VA-API (Intel/AMD). Newer GStreamer has vah264dec/vah265dec; older uses vaapih264dec/vaapih265dec.
+        pipelines += [
+            front_h264 + 'vah264dec ! ' + tail,        # new
+            front_h265 + 'vah265dec ! ' + tail,        # new
+            front_h264 + 'vaapih264dec ! ' + tail,     # legacy fallback
+            front_h265 + 'vaapih265dec ! ' + tail,     # legacy fallback
+        ]
+
+    # As the last resort on the GStreamer path: decodebin (may still pick HW if available)
+    pipelines += [
+        _gs_common_front(rtsp_url) + 'decodebin ! ' + tail
+    ]
+    return pipelines
+
+
+def _open_with_gst(rtsp_url: str) -> Optional[cv2.VideoCapture]:
+    """
+    Try multiple GStreamer pipelines to open the RTSP stream with HW accel if possible.
+    Returns an opened VideoCapture or None.
+    """
+    if not have_gstreamer():
+        return None
+
+    candidates = _build_hw_pipelines(rtsp_url, vendor=GST_GPU_VENDOR)
+    for pipe in candidates:
+        cap = cv2.VideoCapture(pipe, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    return None
+
+
+def _open_with_ffmpeg(rtsp_url: str) -> Optional[cv2.VideoCapture]:
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    try:
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, OPEN_TIMEOUT_SECONDS * 1000)
+    except Exception:
+        pass
+    try:
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, READ_TIMEOUT_SECONDS * 1000)
+    except Exception:
+        pass
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if cap.isOpened():
+        return cap
+    cap.release()
+    return None
+
+
+def open_capture(rtsp_url: str) -> Optional[cv2.VideoCapture]:
+    """
+    Prefer GStreamer (HW) path. Fall back to FFmpeg (CPU) path.
+    """
+    cap = _open_with_gst(rtsp_url)
+    if cap is not None:
+        return cap
+    return _open_with_ffmpeg(rtsp_url)
+
+
+# ---------------------------------------------------
+#  Original helpers (slightly adapted)
+# ---------------------------------------------------
 
 def encode_creds(user: str, pwd: str) -> Tuple[str, str]:
     return quote(user, safe=""), quote(pwd, safe="")
 
 
 def urls_from_template_for_channel(tmpl: str, ch: int) -> List[str]:
-    """
-    Produce one or more candidate URLs for this specific template and channel,
-    trying both non-padded and zero-padded channel numbers where applicable.
-    """
     u, p = encode_creds(NVR_USER, NVR_PASS)
     ch_variants = [f"{ch}", f"{ch:02d}"]
     hik_cc = f"{ch:02d}"
@@ -100,7 +217,6 @@ def urls_from_template_for_channel(tmpl: str, ch: int) -> List[str]:
         try:
             url = tmpl.format(user=u, pwd=p, ip=NVR_IP, port=NVR_PORT, ch=ch_str, hik_cc=hik_cc)
         except KeyError:
-            # template might not use all keys
             try:
                 url = tmpl.format(user=u, pwd=p, ip=NVR_IP, port=NVR_PORT, ch=ch_str)
             except Exception:
@@ -117,8 +233,8 @@ def urls_from_template_for_channel(tmpl: str, ch: int) -> List[str]:
 
 def candidate_urls(ch: int) -> List[str]:
     u, p = encode_creds(NVR_USER, NVR_PASS)
-    ch_variants = [f"{ch}", f"{ch:02d}"]  # e.g., "1" and "01"
-    hik_cc = f"{ch:02d}"                  # Hik uses 2-digit channel prefix
+    ch_variants = [f"{ch}", f"{ch:02d}"]
+    hik_cc = f"{ch:02d}"
 
     urls = []
     for t in TRY_TEMPLATES:
@@ -126,7 +242,6 @@ def candidate_urls(ch: int) -> List[str]:
             try:
                 url = t.format(user=u, pwd=p, ip=NVR_IP, port=NVR_PORT, ch=ch_str, hik_cc=hik_cc)
             except KeyError:
-                # Template might not have all keys; skip if formatting fails
                 continue
             urls.append(url)
 
@@ -141,19 +256,12 @@ def candidate_urls(ch: int) -> List[str]:
 
 
 def probe_rtsp(url: str, seconds: int = PROBE_SECONDS) -> bool:
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-    # Try to hint timeouts if the backend honors them
-    try:
-        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, OPEN_TIMEOUT_SECONDS * 1000)
-    except Exception:
-        pass
-    try:
-        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, READ_TIMEOUT_SECONDS * 1000)
-    except Exception:
-        pass
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    if not cap.isOpened():
+    """
+    Try to open using GStreamer (HW) first, then FFmpeg (CPU) as fallback.
+    Read a couple seconds to verify stability.
+    """
+    cap = open_capture(url)
+    if cap is None or not cap.isOpened():
         return False
 
     # Warm-up: allow a little time for SPS/PPS and first keyframe
@@ -178,21 +286,19 @@ def probe_rtsp(url: str, seconds: int = PROBE_SECONDS) -> bool:
         if not ok:
             good = False
             break
+
     cap.release()
     return good
 
 
 def find_working_url_for_channel(ch: int) -> Tuple[Optional[str], Optional[str]]:
-    # If a template has been locked in, try it first (and maybe only)
     global SELECTED_TEMPLATE
     if LOCK_TEMPLATE_AFTER_FIRST_MATCH and SELECTED_TEMPLATE:
         for url in urls_from_template_for_channel(SELECTED_TEMPLATE, ch):
             if probe_rtsp(url, seconds=2):
                 return url, SELECTED_TEMPLATE
         if STRICT_LOCKED_TEMPLATE:
-            return None, SELECTED_TEMPLATE  # do not try other templates when strictly locked
-        # else fall through to try other templates as fallback
-    # No locked template yet, or fallback allowed
+            return None, SELECTED_TEMPLATE
     for tmpl in TRY_TEMPLATES:
         for url in urls_from_template_for_channel(tmpl, ch):
             if probe_rtsp(url, seconds=2):
@@ -210,37 +316,35 @@ class StreamReader(threading.Thread):
         self.stop_flag = threading.Event()
 
     def run(self):
-        # Try to open with retries
         backoff = 1.0
         while not self.stop_flag.is_set():
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-            if not cap.isOpened():
+            cap = open_capture(self.url)
+            if cap is None or not cap.isOpened():
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 8.0)
                 continue
 
-            # Optional: tune buffer size/latency (not all builds honor these)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # optional: try to keep latency low; not all backends honor these
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
 
             last_frame_time = time.time()
             while not self.stop_flag.is_set():
                 ok, frame = cap.read()
                 now = time.time()
                 if not ok:
-                    # if we stall for too long, reconnect
                     if now - last_frame_time > READ_TIMEOUT_SECONDS:
                         cap.release()
                         break
                     else:
-                        # brief hiccup—sleep a tad and continue
                         time.sleep(0.02)
                         continue
 
                 last_frame_time = now
                 with self.lock:
                     self.frame_store[self.ch] = (frame, now)
-
-            # reconnect loop will continue
         # end run
 
     def stop(self):
@@ -259,7 +363,14 @@ def make_placeholder(w: int, h: int, text: str) -> np.ndarray:
 
 
 def main():
+    global SELECTED_TEMPLATE
     assert GRID_ROWS * GRID_COLS >= CHANNEL_COUNT, "Grid is smaller than number of channels."
+
+    print(f"GPU vendor (GStreamer): {GST_GPU_VENDOR}")
+    if have_gstreamer():
+        print("GStreamer backend detected. Will try HW decode first.")
+    else:
+        print("GStreamer backend not detected in OpenCV. Using FFmpeg/CPU path.")
 
     print("Discovering working RTSP URLs per channel...")
     urls: Dict[int, Optional[str]] = {}
@@ -277,7 +388,6 @@ def main():
                 SELECTED_TEMPLATE = tmpl
                 print(f"[lock] Using template for all channels: {SELECTED_TEMPLATE}")
         else:
-            # If we are strictly locked to a template and it failed, mark fail
             lock_note = " (locked template)" if (LOCK_TEMPLATE_AFTER_FIRST_MATCH and SELECTED_TEMPLATE and STRICT_LOCKED_TEMPLATE) else ""
             print(f"[{ch}] ✗ No working URL found{lock_note}")
             consecutive_fail += 1
@@ -285,14 +395,12 @@ def main():
         if found_any and consecutive_fail >= EARLY_STOP_CONSECUTIVE_FAILS:
             print(f"Early stop: {consecutive_fail} consecutive no-signal channels after CH {ch}. Proceeding with discovered channels 1..{last_ch}.")
             break
-    # we will only render channels that were actually probed (1..last_ch)
+
     total_channels = last_ch
 
-    # shared frame store (latest frame, timestamp) per channel
     frame_store: Dict[int, Tuple[np.ndarray, float]] = {}
     lock = threading.Lock()
 
-    # Start readers
     readers: List[StreamReader] = []
     for ch, url in urls.items():
         if url is None:
@@ -304,13 +412,11 @@ def main():
     cell_w = CANVAS_W // GRID_COLS
     cell_h = CANVAS_H // GRID_ROWS
 
-    # Pre-create placeholders
     placeholders = {
         ch: make_placeholder(cell_w, cell_h, f"CH {ch} - NO SIGNAL")
         for ch in range(1, total_channels + 1)
     }
 
-    # Mosaic loop
     delay = max(1, int(1000 / max(1, TARGET_FPS)))  # in ms for waitKey
     window_name = f"NVR Mosaic {GRID_COLS}x{GRID_ROWS} ({total_channels} ch)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -323,7 +429,6 @@ def main():
                 for ch in range(1, total_channels + 1):
                     if ch in frame_store:
                         frame, ts = frame_store[ch]
-                        # resize to cell
                         if frame is not None:
                             fr = cv2.resize(frame, (cell_w, cell_h))
                             age = time.time() - ts
@@ -335,12 +440,10 @@ def main():
                     else:
                         tiles.append(placeholders[ch].copy())
 
-            # pad tiles list to full grid (if total_channels < GRID_ROWS*GRID_COLS)
             total_cells = GRID_ROWS * GRID_COLS
             if len(tiles) < total_cells:
                 tiles += [np.zeros((cell_h, cell_w, 3), dtype=np.uint8)] * (total_cells - len(tiles))
 
-            # assemble mosaic
             rows = []
             for r in range(GRID_ROWS):
                 row_tiles = tiles[r * GRID_COLS:(r + 1) * GRID_COLS]
@@ -354,7 +457,6 @@ def main():
     finally:
         for r in readers:
             r.stop()
-        # give threads a moment to exit
         time.sleep(0.5)
         cv2.destroyAllWindows()
 
