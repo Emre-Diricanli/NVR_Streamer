@@ -25,26 +25,26 @@ import cv2
 import numpy as np
 
 # ----------------- CONFIGURE THESE -----------------
-NVR_IP = "192.168.0.71"
-NVR_PORT = 554     
-NVR_USER = "ai"
-NVR_PASS = "1880teso@"
+NVR_IP = "99.99.32.203"
+NVR_PORT = 5541    
+NVR_USER = "admin"
+NVR_PASS = "Liquorhub$2022"
 
-CHANNEL_COUNT = 16    # number of channels to show
+CHANNEL_COUNT = 20    # number of channels to show
 GRID_COLS = 4         # e.g., 4 columns x 3 rows = 12
-GRID_ROWS = 4
+GRID_ROWS = 5
 
 # Overall mosaic resolution (width x height of the window)
 CANVAS_W = 1600
 CANVAS_H = 900
 
 # Target FPS for the mosaic (reduce if your laptop struggles)
-TARGET_FPS = 10
+TARGET_FPS = 5
 
 # Try both non-padded (1) and zero-padded (01) channel numbers with these templates
 TRY_TEMPLATES = [
     # --- Hikvision (CCSS where CC=channel 01.., SS=01 main / 02 sub) ---
-    # "rtsp://{user}:{pwd}@{ip}:{port}/Streaming/Channels/{hik_cc}01",
+    "rtsp://{user}:{pwd}@{ip}:{port}/Streaming/Channels/{hik_cc}01",
     "rtsp://{user}:{pwd}@{ip}:{port}/Streaming/Channels/{hik_cc}02",
 
     # --- Dahua / Amcrest ---
